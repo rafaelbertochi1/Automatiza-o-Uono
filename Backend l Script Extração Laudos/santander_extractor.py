@@ -220,11 +220,11 @@ def extrair_modelo_digital(text):
     val_venda_f_val = None
     val_unit_val = None
 
-    val_mercado_match = re.search(r'VALOR\s+DE\s+MERCADO[^\d\n]*R\$\s*([\d\.,]+)', text, re.IGNORECASE) or re.search(r'R\$\s*([\d\.,]+)', text)
+    val_mercado_match = re.search(r'VALOR\s+DE\s+MERCADO[^\d]*?R\$\s*([\d\.,]+)', text, re.IGNORECASE) or re.search(r'R\$\s*([\d\.,]+)', text)
     if val_mercado_match:
         val_mercado_val = val_mercado_match.group(1)
 
-    val_venda_f_match = re.search(r'VENDA\s+FOR[ÇC]ADA[^\d\n]*R\$\s*([\d\.,]+)', text, re.IGNORECASE)
+    val_venda_f_match = re.search(r'VENDA\s+FOR[ÇC]ADA[^\d]*?R\$\s*([\d\.,]+)', text, re.IGNORECASE)
     if val_venda_f_match:
         val_venda_f_val = val_venda_f_match.group(1)
 
@@ -293,7 +293,8 @@ def extrair_modelo_fisico(text):
     match_18 = re.search(r'18\s*-\s*[ÁA]rea\s+Privativa[^\n]*\n+([^\n]+)', text, re.IGNORECASE)
     if match_18:
         linha_18 = match_18.group(1).strip()
-        val_m = re.search(r'^\s*([\d\.,]+)', linha_18)
+        # O valor fica no fim da linha (ex.: "Ferro 208,13"), não no início
+        val_m = re.search(r'([\d\.,]+)\s*$', linha_18)
         if val_m:
             area_priv = converter_float_seguro(val_m.group(1))
 
@@ -317,19 +318,31 @@ def extrair_modelo_fisico(text):
     # Área total calculada de forma exata
     area_total = round(float(area_priv + area_comum), 2)
 
-    quartos = re.search(r'12\s*-\s*N[°º]?\s*de\s*Dormit[óo]rios.*?\b(\d+)\b', text, re.IGNORECASE | re.DOTALL)
-
+    # Banheiros (seção 11) e Dormitórios (seção 12) ficam lado a lado na mesma
+    # linha de valores ("<banheiros> <dormitórios>"), então precisam ser lidos
+    # de uma vez só — buscar cada rótulo separadamente faz os dois pegarem o
+    # primeiro número da linha (duplicando o valor de banheiros em dormitórios).
     banheiros_val = 0
-    match_banh = re.search(r'11\s*-\s*N[°º]?\s*de\s*Banheiros[^\n]*\n+([0-9]+)', text, re.IGNORECASE)
-    if match_banh:
-        banheiros_val = converter_int_seguro(match_banh.group(1))
+    quartos = None
+    match_11_12 = re.search(
+        r'11\s*-\s*N[°º]?\s*de\s*Banheiros[^\n]*\n+(\d+)\s+(\d+)',
+        text, re.IGNORECASE
+    )
+    if match_11_12:
+        banheiros_val = converter_int_seguro(match_11_12.group(1))
+        quartos = match_11_12.group(2)
 
+    # Mesmo problema em Vagas Cobertas (seção 13) e Vagas Descobertas (seção 14)
     vagas_val = 0
-    m_vagas_13 = re.search(r'13\s*-\s*N[°º]?\s*de\s*Vagas\s+Cobertas[^\n]*\n+([0-9]+)', text, re.IGNORECASE)
-    v13 = converter_int_seguro(m_vagas_13.group(1)) if m_vagas_13 else 0
-
-    m_vagas_14 = re.search(r'14\s*-\s*N[°º]?\s*de\s*Vagas\s+Descobertas[^\n]*\n+([0-9]+)', text, re.IGNORECASE)
-    v14 = converter_int_seguro(m_vagas_14.group(1)) if m_vagas_14 else 0
+    v13 = 0
+    v14 = 0
+    m_vagas_13_14 = re.search(
+        r'13\s*-\s*N[°º]?\s*de\s*Vagas\s+Cobertas[^\n]*\n+(\d+)\s+(\d+)',
+        text, re.IGNORECASE
+    )
+    if m_vagas_13_14:
+        v13 = converter_int_seguro(m_vagas_13_14.group(1))
+        v14 = converter_int_seguro(m_vagas_13_14.group(2))
 
     m_vagas_15 = re.search(r'15\s*-\s*N[°º]?\s*de\s*Vagas\s+Privativas[^\n]*\n+([0-9]+)', text, re.IGNORECASE)
     v15 = converter_int_seguro(m_vagas_15.group(1)) if m_vagas_15 else 0
@@ -402,7 +415,7 @@ def extrair_modelo_fisico(text):
         "area_privativa_m2": area_priv,
         "area_comum_m2": area_comum,
         "area_total_m2": area_total,
-        "quartos": converter_int_seguro(quartos.group(1) if quartos else 0),
+        "quartos": converter_int_seguro(quartos if quartos else 0),
         "suites": total_suites,
         "banheiros": banheiros_val,
         "vagas": vagas_val,
@@ -431,7 +444,7 @@ def extrair_dados_pdf(pdf_path):
             if not full_text.strip():
                 return None
 
-            if "Comparativo direto" in full_text or "QUESTIONARIO" in full_text:
+            if "Comparativo direto" in full_text or "QUESTIONARIO" in full_text or "QUESTIONÁRIO" in full_text:
                 dados = extrair_modelo_fisico(full_text)
             else:
                 dados = extrair_modelo_digital(full_text)

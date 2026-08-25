@@ -526,11 +526,40 @@ def processar_em_lote():
         with psycopg2.connect(host=host_pg, dbname=dbname, user=user, password=password, port=port) as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    DO $$ 
-                    BEGIN 
+                    CREATE TABLE IF NOT EXISTS laudos (
+                        id SERIAL PRIMARY KEY,
+                        numero_proposta TEXT,
+                        codigo_laudo TEXT,
+                        data_avaliacao TEXT,
+                        endereco TEXT,
+                        numero TEXT,
+                        complemento TEXT,
+                        tipo_imovel TEXT,
+                        area_privativa_m2 NUMERIC,
+                        area_comum_m2 NUMERIC,
+                        area_total_m2 NUMERIC,
+                        quartos INTEGER,
+                        suites INTEGER,
+                        banheiros INTEGER,
+                        vagas INTEGER,
+                        idade_anos INTEGER,
+                        padrao_acabamento TEXT,
+                        estado_conservacao TEXT,
+                        valor_mercado NUMERIC,
+                        valor_venda_forcada NUMERIC,
+                        valor_unitario_m2 NUMERIC,
+                        coordenadas TEXT,
+                        latitude DOUBLE PRECISION,
+                        longitude DOUBLE PRECISION,
+                        path TEXT
+                    );
+                """)
+                cursor.execute("""
+                    DO $$
+                    BEGIN
                         IF NOT EXISTS (
                             SELECT 1 FROM pg_constraint WHERE conname = 'laudos_path_key'
-                        ) THEN 
+                        ) THEN
                             ALTER TABLE laudos ADD CONSTRAINT laudos_path_key UNIQUE (path);
                         END IF;
                     END $$;

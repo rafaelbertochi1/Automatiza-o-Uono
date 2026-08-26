@@ -101,6 +101,33 @@ def extrair_numero_proposta(text):
     m = re.search(r'\b(\d{7,10})\b', text)
     return m.group(1) if m else ""
 
+def extrair_data_avaliacao(text):
+    """Extrai a data em que a vistoria (visita ao imóvel) foi realmente
+    feita - NÃO a data em que a proposta foi apenas solicitada.
+
+    A primeira data que aparece no documento é sempre a "Data Solicitação"
+    do cabeçalho (tabela DADOS DO PEDIDO/Solicitante), que pode ficar dias
+    ou até semanas antes da vistoria de fato (confirmado no laudo_TAT1064:
+    solicitação em 02/07 e fotos da vistoria só em 24/07 - 22 dias depois).
+    A seção RELATÓRIO FOTOGRÁFICO traz o carimbo de data/hora de cada foto
+    tirada durante a visita, então usamos a primeira data logo depois dela
+    como âncora confiável da data real da vistoria/avaliação. A nota
+    "Vistoria realizada em ..." (quando existe) confirma a mesma data, mas
+    nem todo laudo tem essa nota, então ela só serve de segunda opção.
+    """
+    m = re.search(r'RELAT[ÓO]RIO\s+FOTOGR[ÁA]FICO[^\n]*\n+\s*(\d{2}/\d{2}/\d{4})', text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    m = re.search(r'Vistoria\s+realizada\s+em\s+(\d{2}/\d{2}/\d{4})', text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    # Último recurso: primeira data solta do documento (pode ser a Data
+    # Solicitação, mas é melhor que ficar sem nenhuma data).
+    m = re.search(r'(\d{2}/\d{2}/\d{4})', text)
+    return m.group(1) if m else None
+
 # ----------------------------------------------------------------------
 # 1.1 EXTRAÇÃO DE COORDENADAS
 # ----------------------------------------------------------------------
@@ -187,8 +214,8 @@ def extrair_modelo_digital(text):
     cod_laudo = re.search(r'#(TA[NOP]\d+|\w+\d+)', text)
     num_proposta_val = extrair_numero_proposta(text)
 
-    data_aval = re.search(r'(\d{2}/\d{2}/\d{4})', text)
-    
+    data_aval_val = extrair_data_avaliacao(text)
+
     endereco_val, num_val_fallback = extrair_endereco_numero(text)
     
     num_busca = re.search(r'N[úu]mero\s*[\n\r]+\s*([0-9a-zA-Z/]+)', text, re.IGNORECASE)
@@ -196,7 +223,7 @@ def extrair_modelo_digital(text):
 
     compl_val = extrair_complemento_generico(text)
 
-    tipo_imovel = re.search(r'\b(Apartamento\s*Tipo|Apartamento|Casa|Sobrado|Terreno(?:\s*-\s*Lote)?)\b', text, re.IGNORECASE)
+    tipo_imovel = re.search(r'\b(M[úu]ltiplas\s+Unidades|Apartamento\s*Tipo|Apartamento|Casa|Sobrado|Terreno(?:\s*-\s*Lote)?)\b', text, re.IGNORECASE)
     tipo_imovel_val = tipo_imovel.group(1).strip() if tipo_imovel else "Apartamento"
 
     area_priv_match = re.search(r'(?:[Áá]rea\s+privativa[^\d]*|privativa[^\d]*)(\d{1,5}[,\.]?\d{0,2})', text, re.IGNORECASE)
@@ -270,7 +297,7 @@ def extrair_modelo_digital(text):
     return {
         "numero_proposta": num_proposta_val,
         "codigo_laudo": cod_laudo.group(1) if cod_laudo else None,
-        "data_avaliacao": data_aval.group(1) if data_aval else None,
+        "data_avaliacao": data_aval_val,
         "endereco": limpar_txt(endereco_val),
         "numero": limpar_txt(num_val, valor_padrao="S/N"),
         "complemento": compl_val,
@@ -299,12 +326,12 @@ def extrair_modelo_digital(text):
 def extrair_modelo_fisico(text):
     cod_laudo = re.search(r'#(TAP\d+|\w+\d+)', text)
     num_proposta_val = extrair_numero_proposta(text)
-    data_aval = re.search(r'(\d{2}/\d{2}/\d{4})', text)
+    data_aval_val = extrair_data_avaliacao(text)
 
     endereco_bruto, num_val = extrair_endereco_numero(text)
     compl_val = extrair_complemento_generico(text)
 
-    tipo_imovel = re.search(r'\b(Apartamento|Casa|Sobrado|Terreno(?:\s*-\s*Lote)?)\b', text, re.IGNORECASE)
+    tipo_imovel = re.search(r'\b(M[úu]ltiplas\s+Unidades|Apartamento|Casa|Sobrado|Terreno(?:\s*-\s*Lote)?)\b', text, re.IGNORECASE)
     tipo_imovel_val = tipo_imovel.group(1) if tipo_imovel else "Apartamento"
 
     # ------------------------------------------------------------------
@@ -431,7 +458,7 @@ def extrair_modelo_fisico(text):
     return {
         "numero_proposta": num_proposta_val,
         "codigo_laudo": cod_laudo.group(1) if cod_laudo else None,
-        "data_avaliacao": data_aval.group(1) if data_aval else None,
+        "data_avaliacao": data_aval_val,
         "endereco": limpar_txt(endereco_bruto),
         "numero": num_val,
         "complemento": compl_val,

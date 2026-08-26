@@ -1,10 +1,10 @@
 import os
 import re
 import multiprocessing
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import pdfplumber
 import psycopg2
-from psycopg2.extras import execute_values
 
 # ----------------------------------------------------------------------
 # 1. FUNÇÕES AUXILIARES DE TRATAMENTO DE DADOS
@@ -74,6 +74,32 @@ def limpar_txt(val, valor_padrao=""):
     txt = re.sub(r'^(Número|Complemento|Matrícula|Núm|Bairro|Municipio|UF|Endere[çc]o)\s*', '', txt, flags=re.IGNORECASE)
     txt = str(txt).strip()
     return txt if txt and txt.upper() != "NULL" else valor_padrao
+
+def extrair_numero_proposta(text):
+    """Extrai o N° de Proposta do cabeçalho ('DADOS DO PEDIDO').
+
+    O cabeçalho é uma tabela de 3 colunas (Solicitante / N° da Proposta /
+    Data Solicitação), com os valores numa única linha logo abaixo dos
+    rótulos - ex: "Santander 2.714.283 01/07/2026". O número às vezes vem
+    com pontos de milhar. Usamos a data que sempre vem logo depois como
+    âncora pra garantir que pegamos o número certo (evita cair no CREA do
+    avaliador ou outro número solto do documento).
+    """
+    m = re.search(
+        r'N[º°]?\s*da\s*Proposta[^\n]*\n(?:\S+\s+)?([\d][\d\.]{4,14}\d)\s+\d{2}/\d{2}/\d{4}',
+        text, re.IGNORECASE
+    )
+    if m:
+        return m.group(1).replace('.', '')
+
+    # Rótulo e valor juntos, sem o layout de tabela acima
+    m = re.search(r'(?:Proposta|N[º°]?\s*da\s*Proposta)\s*[:\n]?\s*(\d{6,12})', text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    # Último recurso: primeiro número solto de 7-10 dígitos no documento
+    m = re.search(r'\b(\d{7,10})\b', text)
+    return m.group(1) if m else ""
 
 # ----------------------------------------------------------------------
 # 1.1 EXTRAÇÃO DE COORDENADAS
@@ -159,9 +185,7 @@ def extrair_complemento_generico(text):
 # ----------------------------------------------------------------------
 def extrair_modelo_digital(text):
     cod_laudo = re.search(r'#(TA[NOP]\d+|\w+\d+)', text)
-    num_prop_match = re.search(r'(?:Proposta|N[º°]?\s*da\s*Proposta)\s*[:\n]?\s*(\d{6,12})', text, re.IGNORECASE) or \
-                     re.search(r'\b(\d{7,10})\b', text)
-    num_proposta_val = num_prop_match.group(1) if num_prop_match else ""
+    num_proposta_val = extrair_numero_proposta(text)
 
     data_aval = re.search(r'(\d{2}/\d{2}/\d{4})', text)
     
@@ -274,10 +298,7 @@ def extrair_modelo_digital(text):
 # ----------------------------------------------------------------------
 def extrair_modelo_fisico(text):
     cod_laudo = re.search(r'#(TAP\d+|\w+\d+)', text)
-    num_proposta = re.search(r'(?:Proposta|N[º°]?\s*da\s*Proposta)\s*[:\n]?\s*(\d{6,12})', text, re.IGNORECASE) or \
-                   re.search(r'\b(\d{7,10})\b', text)
-
-    num_proposta_val = num_proposta.group(1) if num_proposta else ""
+    num_proposta_val = extrair_numero_proposta(text)
     data_aval = re.search(r'(\d{2}/\d{2}/\d{4})', text)
 
     endereco_bruto, num_val = extrair_endereco_numero(text)
@@ -293,8 +314,11 @@ def extrair_modelo_fisico(text):
     match_18 = re.search(r'18\s*-\s*[ÁA]rea\s+Privativa[^\n]*\n+([^\n]+)', text, re.IGNORECASE)
     if match_18:
         linha_18 = match_18.group(1).strip()
-        # O valor fica no fim da linha (ex.: "Ferro 208,13"), não no início
-        val_m = re.search(r'([\d\.,]+)\s*$', linha_18)
+        # Às vezes o pdfplumber extrai o número com um espaço solto no meio
+        # (ex.: "Ferro 131. 7" em vez de "Ferro 131,7"), quebrando o "fim da
+        # linha" no meio do valor. Removemos espaços antes de procurar o
+        # número, pra pegar "131.7" inteiro em vez de só o "7" final.
+        val_m = re.search(r'([\d\.,]+)$', re.sub(r'\s+', '', linha_18))
         if val_m:
             area_priv = converter_float_seguro(val_m.group(1))
 
@@ -493,42 +517,44 @@ def processar_em_lote():
     port = os.getenv("PGPORT", "5432")
 
     colunas = list(dados_extraidos[0].keys())
-    # "Duplicata" = mesmo N° de Proposta (numero_proposta), não mesmo nome
-    # de arquivo. Assim, baixar/reprocessar o mesmo laudo em datas ou
-    # arquivos diferentes atualiza a linha existente em vez de criar outra.
-    # A condição "WHERE numero_proposta <> ''" evita que dois laudos cujo
-    # número não foi identificado (campo vazio) se sobrescrevam por engano.
-    query_upsert_laudos = f"""
-        INSERT INTO laudos ({', '.join(colunas)})
-        VALUES %s
-        ON CONFLICT (numero_proposta) WHERE numero_proposta <> '' DO UPDATE SET
-            codigo_laudo = EXCLUDED.codigo_laudo,
-            data_avaliacao = EXCLUDED.data_avaliacao,
-            endereco = EXCLUDED.endereco,
-            numero = EXCLUDED.numero,
-            complemento = EXCLUDED.complemento,
-            tipo_imovel = EXCLUDED.tipo_imovel,
-            area_privativa_m2 = EXCLUDED.area_privativa_m2,
-            area_comum_m2 = EXCLUDED.area_comum_m2,
-            area_total_m2 = EXCLUDED.area_total_m2,
-            quartos = EXCLUDED.quartos,
-            suites = EXCLUDED.suites,
-            banheiros = EXCLUDED.banheiros,
-            vagas = EXCLUDED.vagas,
-            idade_anos = EXCLUDED.idade_anos,
-            padrao_acabamento = EXCLUDED.padrao_acabamento,
-            estado_conservacao = EXCLUDED.estado_conservacao,
-            valor_mercado = EXCLUDED.valor_mercado,
-            valor_venda_forcada = EXCLUDED.valor_venda_forcada,
-            valor_unitario_m2 = EXCLUDED.valor_unitario_m2,
-            coordenadas = EXCLUDED.coordenadas,
-            latitude = EXCLUDED.latitude,
-            longitude = EXCLUDED.longitude,
-            path = EXCLUDED.path,
-            modelo_usado = EXCLUDED.modelo_usado;
-    """
 
-    valores_laudos = [[d[col] for col in colunas] for d in dados_extraidos]
+    # Avisa se dois ou mais arquivos extraíram o MESMO código de laudo
+    # (TAT/TAN/TAP...) - isso NUNCA deve acontecer de verdade (cada
+    # inspeção tem um código único), então é sinal de erro de extração
+    # nesses arquivos. Repetir N° de Proposta é normal e esperado (uma
+    # mesma proposta pode ter mais de um laudo/inspeção).
+    arquivos_por_codigo = defaultdict(list)
+    for d in dados_extraidos:
+        if d["codigo_laudo"]:
+            arquivos_por_codigo[d["codigo_laudo"]].append(d["path"])
+    duplicados = {k: v for k, v in arquivos_por_codigo.items() if len(v) > 1}
+    if duplicados:
+        print("\n[AVISO] Mais de um arquivo extraiu o mesmo código de laudo (isso não deveria acontecer):")
+        for codigo, arquivos in duplicados.items():
+            print(f"  Código {codigo}: {', '.join(arquivos)}")
+        print("  (o último desses arquivos processado vai prevalecer no banco -")
+        print("  vale conferir manualmente a extração desses PDFs)\n")
+
+    # "Duplicata" = mesmo código de laudo (codigo_laudo, ex: TAT7848) - é o
+    # único identificador que nunca se repete de verdade. N° de Proposta
+    # PODE se repetir legitimamente (mais de um laudo pra mesma proposta),
+    # então não pode ser usado como chave de duplicata.
+    # A condição "WHERE codigo_laudo IS NOT NULL" evita que dois laudos cujo
+    # código não foi identificado se sobrescrevam por engano.
+    # Cada linha é inserida com seu próprio comando (em vez de um lote só):
+    # isso permite que duas linhas com o mesmo código se sobrescrevam em
+    # sequência sem quebrar a carga inteira (o Postgres não permite que um
+    # único comando "atualize a mesma linha duas vezes").
+    set_clause = ",\n            ".join(
+        f"{col} = EXCLUDED.{col}" for col in colunas if col != "codigo_laudo"
+    )
+    placeholders = ", ".join(["%s"] * len(colunas))
+    query_upsert_linha = f"""
+        INSERT INTO laudos ({', '.join(colunas)})
+        VALUES ({placeholders})
+        ON CONFLICT (codigo_laudo) WHERE codigo_laudo IS NOT NULL DO UPDATE SET
+            {set_clause};
+    """
 
     try:
         with psycopg2.connect(host=host_pg, dbname=dbname, user=user, password=password, port=port) as conn:
@@ -574,16 +600,34 @@ def processar_em_lote():
                 cursor.execute("""
                     ALTER TABLE laudos DROP CONSTRAINT IF EXISTS laudos_path_key;
                 """)
-                # Índice único parcial: garante 1 linha por N° de Proposta,
-                # mas ignora laudos com numero_proposta vazio (não identificado)
-                # para eles não colidirem uns com os outros.
+                # Índice antigo (baseado em numero_proposta) de uma versão
+                # anterior deste script - N° de Proposta pode se repetir
+                # legitimamente, então essa regra estava errada. Remove se
+                # existir no seu banco.
                 cursor.execute("""
-                    CREATE UNIQUE INDEX IF NOT EXISTS laudos_numero_proposta_key
-                    ON laudos (numero_proposta) WHERE numero_proposta <> '';
+                    DROP INDEX IF EXISTS laudos_numero_proposta_key;
                 """)
-                execute_values(cursor, query_upsert_laudos, valores_laudos, page_size=100)
+                # Índice único parcial de verdade: garante 1 linha por código
+                # de laudo (TAT/TAN/TAP...), que nunca se repete de verdade,
+                # ignorando os poucos casos em que a extração não conseguiu
+                # identificar o código (fica NULL) - esses não colidem entre si.
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS laudos_codigo_laudo_key
+                    ON laudos (codigo_laudo) WHERE codigo_laudo IS NOT NULL;
+                """)
+                gravados = 0
+                falhas = 0
+                for dados in dados_extraidos:
+                    valores = [dados[col] for col in colunas]
+                    try:
+                        cursor.execute(query_upsert_linha, valores)
+                        gravados += 1
+                    except Exception as e:
+                        conn.rollback()
+                        falhas += 1
+                        print(f"[ERRO - PULADO] {dados.get('path')}: {str(e).splitlines()[0]}")
                 conn.commit()
-                print("[SUCESSO TOTAL] Processamento paralelo e carga em lote executados!")
+                print(f"[SUCESSO] {gravados} laudo(s) gravado(s) no banco. {falhas} com erro (pulados).")
     except Exception as e:
         print(f"[ERRO CARGA BANCO]: {str(e)}")
 

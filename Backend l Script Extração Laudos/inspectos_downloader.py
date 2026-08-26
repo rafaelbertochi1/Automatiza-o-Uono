@@ -16,24 +16,29 @@ primeiro, veja até onde ele consegue ir sozinho, e me mande o erro
 exato que aparecer no terminal (a última linha, tipo
 "playwright._impl._api_types.TimeoutError: ...") que eu ajusto.
 
-SEGURANÇA: o e-mail e a senha são digitados na hora que você roda o
-script (nunca ficam salvos no arquivo nem vão pro GitHub).
+LOGIN: o robô guarda a sessão (cookies) num arquivo próprio depois de um
+login bem-sucedido, e recarrega esse arquivo nas próximas execuções - não
+pede e-mail/senha. Se a sessão expirar, ele pausa e pede pra você fazer
+login manualmente na janela do Chrome, uma vez, e salva de novo.
 """
 
 import os
 import re
 import sys
-import getpass
 from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 LOGIN_URL = "https://inspectos.com/sistema/index.html#/home"
 PASTA_SCRIPT = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(PASTA_SCRIPT, "data", "laudos")
-# Pasta onde o Chrome guarda a sessão/cookies de login entre uma execução
-# e outra. NUNCA suba essa pasta pro GitHub (já está no .gitignore) -
-# ela guarda o acesso logado à sua conta da Inspectos.
-PERFIL_DIR = os.path.join(PASTA_SCRIPT, "chrome_profile_inspectos")
+# Arquivo com os cookies/sessão salvos depois do último login bem-sucedido.
+# NUNCA suba esse arquivo pro GitHub (já está no .gitignore) - ele guarda
+# o acesso logado à sua conta da Inspectos. Usamos um arquivo próprio (em
+# vez de só a pasta de perfil do Chrome) porque o cookie de login da
+# Inspectos parece ser um "cookie de sessão", que o navegador descarta de
+# propósito ao fechar normalmente - salvando/recarregando manualmente,
+# contornamos isso.
+SESSION_FILE = os.path.join(PASTA_SCRIPT, "sessao_inspectos.json")
 # Cada execução salva um log completo aqui (também nunca vai pro GitHub).
 LOG_DIR = os.path.join(PASTA_SCRIPT, "logs")
 
@@ -93,7 +98,6 @@ def pausar_para_usuario(*linhas_instrucao):
 
 def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    os.makedirs(PERFIL_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
 
     # Tudo que aparece no terminal a partir daqui também é salvo num
@@ -110,53 +114,37 @@ def main():
     print(f"Log desta execução: {log_path}")
     data_inicio = pedir_dado("Data inicial (dd/mm/aaaa)")
     data_fim = pedir_dado("Data final (dd/mm/aaaa)")
-    email = pedir_dado("E-mail Inspectos")
     # O que você digita no input() não aparece sozinho no arquivo de log
     # (só o teclado ecoando na tela, não passa pelo print) - por isso
     # repetimos aqui, pra o log sempre mostrar qual período foi usado.
     print(f"Período usado: {data_inicio} até {data_fim}")
-    print("\n" + "-" * 60)
-    print(">>> PRECISO DE UMA INFORMAÇÃO SUA <<<")
-    senha = getpass.getpass("Senha Inspectos (não aparece na tela, é normal): ")
 
     with sync_playwright() as p:
         # A janela do Chrome fica sempre visível (headless=False) - de
         # propósito, pra você poder ver e responder se a verificação de
         # segurança (MFA) pedir de novo. MODO_RAPIDO só controla a pausa
         # artificial entre cliques (slow_mo).
-        # launch_persistent_context guarda a sessão em PERFIL_DIR: depois
-        # da primeira vez que você confirmar o código de verificação (MFA)
-        # manualmente, as próximas execuções não devem mais pedir isso.
-        context = p.chromium.launch_persistent_context(
-            PERFIL_DIR,
-            headless=False,
-            slow_mo=0 if MODO_RAPIDO else 300,
+        browser = p.chromium.launch(headless=False, slow_mo=0 if MODO_RAPIDO else 300)
+        # Se já existe uma sessão salva de uma execução anterior, carrega
+        # ela agora (cookies + localStorage), em vez de começar do zero.
+        sessao_existente = os.path.exists(SESSION_FILE)
+        context = browser.new_context(
             accept_downloads=True,
+            storage_state=SESSION_FILE if sessao_existente else None,
         )
         page = context.new_page()
 
+        def salvar_sessao():
+            context.storage_state(path=SESSION_FILE)
+
         try:
             # ----------------------------------------------------------------
-            # 1. LOGIN
+            # 1. USAR A SESSÃO JÁ SALVA (sem pedir e-mail/senha)
             # ----------------------------------------------------------------
-            print("\n[1/6] Abrindo página de login...")
-            page.goto(LOGIN_URL)
-            page.wait_for_selector("input", timeout=15000)
-            # O "E-mail"/"Senha" na tela é só texto ao lado do campo, não um
-            # <label> ligado a ele - por isso localizamos pelo tipo/posição
-            # do campo em vez do texto do rótulo.
-            page.locator("input[type='password']").fill(senha)
-            page.locator("input:not([type='password']):not([type='checkbox'])").first.fill(email)
-            page.get_by_role("button", name=re.compile("entrar|login|acessar", re.IGNORECASE)).click()
-
-            # ----------------------------------------------------------------
-            # 2. PASSAR PELA TELA(S) PÓS-LOGIN (escolha de cliente / MFA)
-            # ----------------------------------------------------------------
-            # Ordem confirmada do site: a escolha do cliente (Santander)
-            # sempre vem ANTES da verificação de segurança por e-mail (se
-            # ela aparecer). A verificação só costuma pedir na primeira vez
-            # com um perfil/sessão novo em PERFIL_DIR.
-            print("[2/6] Aguardando tela pós-login...")
+            # SESSION_FILE guarda os cookies de login, cliente selecionado e
+            # verificação de segurança confirmados numa execução anterior.
+            # Vamos direto pra URL do painel, sem passar pela tela de login.
+            print("\n[1/4] Verificando sessão salva...")
 
             def chegou_no_painel(timeout=8000):
                 try:
@@ -165,54 +153,35 @@ def main():
                 except PlaywrightTimeout:
                     return False
 
-            # Espera curta aqui (2s): na prática a escolha de cliente sempre
-            # aparece, então não vale a pena esperar vários segundos por um
-            # cenário raro (sessão pular direto pro painel) antes de agir.
-            if chegou_no_painel(timeout=2000):
-                print("      Já entrou direto no painel do Santander (sessão já confiável).")
+            page.goto(LOGIN_URL)
+            if sessao_existente and chegou_no_painel(timeout=10000):
+                print("      Sessão válida, painel carregado direto.")
             else:
-                # Tela "Escolha o cliente desejado": 2 cartões lado a lado
-                # (Itaú à esquerda, Santander à direita), com 2 links
-                # "SELECIONAR" nessa mesma ordem. Pegamos o segundo.
-                print("      Selecionando cliente Santander...")
-                page.wait_for_selector("text=SELECIONAR", timeout=40000)
-                page.get_by_text("SELECIONAR", exact=True).nth(1).click()
-
-                # Espera a tela pós-login terminar de carregar de vez - pode
-                # ser a verificação de segurança (MFA) ou já o painel
-                # principal, dependendo da sessão. Esperamos por QUALQUER UM
-                # dos dois (o que aparecer primeiro), com um tempo mais
-                # generoso (30s) do que uma checagem rápida isolada.
-                print("      Aguardando tela pós-login carregar...")
-                try:
-                    page.locator("text=VERIFICAÇÃO DE SEGURANÇA").or_(
-                        page.locator("text=GRID DE INSPEÇÃO")
-                    ).first.wait_for(timeout=30000)
-                except PlaywrightTimeout:
-                    pass  # nenhum dos dois apareceu a tempo - tratado abaixo
-
-                # O robô não tem como ler o código do seu e-mail/SMS, então
-                # a verificação de segurança (se apareceu) é manual.
-                if page.locator("text=VERIFICAÇÃO DE SEGURANÇA").count() > 0:
-                    pausar_para_usuario(
-                        "A Inspectos pediu uma verificação de segurança (MFA).",
-                        "1. Na janela do Chrome, escolha E-MAIL (ou SMS/App).",
-                        "2. Digite o código que você receber e confirme.",
-                        "3. Espere até estar de volta dentro do sistema.",
-                    )
-
-                if not chegou_no_painel(timeout=15000):
-                    pausar_para_usuario(
-                        "O robô ainda não conseguiu chegar no painel principal",
-                        "(a tela com 'GRID DE INSPEÇÃO').",
-                        "Complete manualmente o que estiver faltando na tela até",
-                        "chegar lá.",
-                    )
+                # A sessão salva expirou, foi limpa, nunca existiu, ou pediu
+                # verificação de novo. Como o robô não tem como digitar
+                # e-mail/senha nem ler um código de segurança, esse trecho é
+                # sempre manual.
+                pausar_para_usuario(
+                    "A sessão salva não está mais válida (ou pediu login/",
+                    "verificação de novo).",
+                    "1. Faça o login manualmente na janela do Chrome (e-mail e senha).",
+                    "2. Selecione o cliente Santander, se for pedido.",
+                    "3. Complete a verificação de segurança, se pedir.",
+                    "4. Espere até ver a tela com 'GRID DE INSPEÇÃO'.",
+                )
+                if not chegou_no_painel(timeout=10000):
+                    print("\n[ERRO] Ainda não consegui ver o painel principal (GRID DE INSPEÇÃO).")
+                    print("Encerrando esta execução.")
+                    return
+                # Login (re)feito com sucesso - salva a sessão agora pra não
+                # precisar repetir esse passo manual da próxima vez.
+                salvar_sessao()
+                print("      Sessão salva para as próximas execuções.")
 
             # ----------------------------------------------------------------
-            # 3. MENU -> ADMINISTRATIVO -> RELATÓRIOS -> INSPEÇÕES -> ANALÍTICO
+            # 2. MENU -> ADMINISTRATIVO -> RELATÓRIOS -> INSPEÇÕES -> ANALÍTICO
             # ----------------------------------------------------------------
-            print("[3/6] Navegando até Relatório Analítico...")
+            print("[2/4] Navegando até Relatório Analítico...")
             page.wait_for_selector("text=GRID DE INSPEÇÃO", timeout=20000)
             # Botão de hambúrguer real (confirmado via Inspecionar elemento):
             # <button class="hamburger hamburger--collapse" ng-click="exibirMenu()">
@@ -223,9 +192,9 @@ def main():
             page.click("text=Analítico")
 
             # ----------------------------------------------------------------
-            # 4. PREENCHER PERÍODO E CLICAR EM EXIBIR
+            # 3. PREENCHER PERÍODO E CLICAR EM EXIBIR
             # ----------------------------------------------------------------
-            print("[4/6] Preenchendo período e clicando em Exibir...")
+            print("[3/4] Preenchendo período e clicando em Exibir...")
             page.wait_for_selector("text=PERÍODO DE SOLICITAÇÃO DA INSPEÇÃO", timeout=15000)
             # A classe "insp360-filtro-data" NÃO é exclusiva desses 2 campos -
             # o painel FILTROS (recolhido) tem vários outros pares de data
@@ -254,9 +223,9 @@ def main():
             page.get_by_role("button", name="Exibir").click()
 
             # ----------------------------------------------------------------
-            # 5. PERCORRER A LISTA DE LAUDOS (COM PAGINAÇÃO)
+            # 4. PERCORRER A LISTA DE LAUDOS (COM PAGINAÇÃO)
             # ----------------------------------------------------------------
-            print("[5/6] Processando lista de laudos...")
+            print("[4/4] Processando lista de laudos...")
             # Não é uma <table> HTML de verdade: cada linha de dado é uma
             # <div class="insp360-mouse-link insp360-tabela-relatorio insp360-cor-tabela-rel"
             #      ng-repeat="insp in listaInspecao">
@@ -272,29 +241,39 @@ def main():
             pagina_num = 1
 
             while total_baixados < LIMITE_TESTE:
-                # Lemos o N° de Proposta e ID de TODAS as linhas da página
-                # de uma vez, ANTES de abrir qualquer modal. Depois de abrir
-                # e fechar um modal, a lista pode reorganizar seus elementos
-                # internamente - por isso NÃO usamos mais a posição (1ª, 2ª,
-                # 3ª linha...) pra reabrir cada laudo, e sim o N° de Proposta
-                # (relocalizamos a linha certa pelo conteúdo, não pela posição).
+                # Lemos o código (ID) de TODAS as linhas da página de uma vez,
+                # ANTES de abrir qualquer modal. Depois de abrir e fechar um
+                # modal, a lista pode reorganizar seus elementos internamente
+                # - por isso NÃO usamos a posição (1ª, 2ª, 3ª linha...) pra
+                # reabrir cada laudo, e sim o código do laudo (TAT/TAN/TAP...),
+                # que é o único identificador que nunca se repete (N° de
+                # Proposta PODE se repetir legitimamente entre laudos
+                # diferentes, então não pode ser usado pra identificar a linha
+                # nem pra nomear o arquivo).
                 linhas = page.locator(LINHA_SELECTOR)
                 qtd_linhas = linhas.count()
 
                 # A mesma linha aparece duplicada várias vezes no HTML dessa
                 # tela (provavelmente uma versão escondida por responsividade,
                 # igual achamos com o botão "próxima"). Por isso removemos
-                # duplicatas pelo N° de Proposta antes de processar, senão o
+                # duplicatas pelo código do laudo antes de processar, senão o
                 # mesmo laudo é reaberto várias vezes à toa na mesma página.
                 laudos_da_pagina = []
-                propostas_vistas = set()
+                codigos_vistos = set()
                 for i in range(qtd_linhas):
                     texto_linha = linhas.nth(i).inner_text()
-                    numero_proposta = extrair_numero_proposta(texto_linha) or f"linha{i}"
                     laudo_id = texto_linha.split("\n")[0].strip()
-                    if numero_proposta in propostas_vistas:
+                    # As cópias duplicadas dessa linha no HTML vêm com o
+                    # código em branco (provavelmente uma variante de layout
+                    # responsivo que esconde essa coluna) - sem código de
+                    # verdade não dá pra identificar nem reabrir a linha
+                    # depois, então só descartamos, sem tratar como erro.
+                    if not laudo_id:
                         continue
-                    propostas_vistas.add(numero_proposta)
+                    if laudo_id in codigos_vistos:
+                        continue
+                    codigos_vistos.add(laudo_id)
+                    numero_proposta = extrair_numero_proposta(texto_linha) or ""
                     laudos_da_pagina.append((numero_proposta, laudo_id))
 
                 print(f"  Página {pagina_num}: {len(laudos_da_pagina)} laudos únicos encontrados na tela.")
@@ -303,7 +282,7 @@ def main():
                     if total_baixados >= LIMITE_TESTE:
                         break
 
-                    destino = os.path.join(DOWNLOAD_DIR, f"laudo_{numero_proposta}.pdf")
+                    destino = os.path.join(DOWNLOAD_DIR, f"laudo_{laudo_id}.pdf")
 
                     # Se esse laudo já foi baixado numa execução anterior
                     # (o arquivo já existe em data/laudos), pula sem nem
@@ -321,9 +300,9 @@ def main():
                     # continua pro próximo - nunca para o lote inteiro por
                     # causa de um caso isolado.
                     try:
-                        # Relocaliza a linha AGORA, pelo N° de Proposta (não
-                        # por posição), pra pegar o estado atual da lista.
-                        linha = page.locator(LINHA_SELECTOR, has_text=numero_proposta)
+                        # Relocaliza a linha AGORA, pelo código do laudo (não
+                        # por posição nem por N° de Proposta, que pode repetir).
+                        linha = page.locator(LINHA_SELECTOR, has_text=laudo_id)
                         if linha.count() == 0:
                             print(f"       [PULADO] Não achei mais a linha de {laudo_id} na tela.")
                             total_erros += 1
@@ -398,7 +377,7 @@ def main():
                 pagina_num += 1
                 page.wait_for_selector(LINHA_SELECTOR, timeout=15000)
 
-            print("\n[6/6] Concluído!")
+            print("\nConcluído!")
             print("-" * 60)
             print(f"  Baixados agora:            {total_baixados}")
             print(f"  Já existiam (pulados):     {total_pulados_existentes}")
@@ -416,11 +395,19 @@ def main():
             print("\n[ERRO INESPERADO]")
             print(str(e))
         finally:
+            # Salva a sessão de novo antes de fechar (cobre o caso da
+            # sessão que já estava valida desde o início) - se o navegador
+            # já quebrou por causa de um erro, ignora, não tem sessão pra
+            # salvar mesmo.
+            try:
+                salvar_sessao()
+            except Exception:
+                pass
             print("\n" + "#" * 60)
             print("#  A AÇÃO É SUA AGORA - O ROBÔ ESTÁ PAUSADO")
             print("#" * 60)
             input(">>> Pressione ENTER aqui para fechar o navegador... ")
-            context.close()
+            browser.close()
             sys.stdout = stdout_original
             log_file.close()
 

@@ -1,5 +1,7 @@
-# Sessão salva do navegador do robô de download (Inspectos) - contém
-# cookies de login, NUNCA deve ir pro GitHub.
+# Sessão salva do robô de download (Inspectos) - contém cookies de login,
+# NUNCA deve ir pro GitHub.
+**/sessao_inspectos.json
+# Pasta antiga de perfil do Chrome (versão anterior do robô) - mesma razão.
 **/chrome_profile_inspectos/
 
 # Laudos baixados (PDFs) contêm dados confidenciais de clientes (CPF,

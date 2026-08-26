@@ -446,8 +446,10 @@ def extrair_dados_pdf(pdf_path):
 
             if "Comparativo direto" in full_text or "QUESTIONARIO" in full_text or "QUESTIONÁRIO" in full_text:
                 dados = extrair_modelo_fisico(full_text)
+                dados["modelo_usado"] = "fisico"
             else:
                 dados = extrair_modelo_digital(full_text)
+                dados["modelo_usado"] = "digital"
 
             dados["path"] = file_name
             return dados
@@ -491,11 +493,15 @@ def processar_em_lote():
     port = os.getenv("PGPORT", "5432")
 
     colunas = list(dados_extraidos[0].keys())
+    # "Duplicata" = mesmo N° de Proposta (numero_proposta), não mesmo nome
+    # de arquivo. Assim, baixar/reprocessar o mesmo laudo em datas ou
+    # arquivos diferentes atualiza a linha existente em vez de criar outra.
+    # A condição "WHERE numero_proposta <> ''" evita que dois laudos cujo
+    # número não foi identificado (campo vazio) se sobrescrevam por engano.
     query_upsert_laudos = f"""
         INSERT INTO laudos ({', '.join(colunas)})
         VALUES %s
-        ON CONFLICT (path) DO UPDATE SET
-            numero_proposta = EXCLUDED.numero_proposta,
+        ON CONFLICT (numero_proposta) WHERE numero_proposta <> '' DO UPDATE SET
             codigo_laudo = EXCLUDED.codigo_laudo,
             data_avaliacao = EXCLUDED.data_avaliacao,
             endereco = EXCLUDED.endereco,
@@ -517,7 +523,9 @@ def processar_em_lote():
             valor_unitario_m2 = EXCLUDED.valor_unitario_m2,
             coordenadas = EXCLUDED.coordenadas,
             latitude = EXCLUDED.latitude,
-            longitude = EXCLUDED.longitude;
+            longitude = EXCLUDED.longitude,
+            path = EXCLUDED.path,
+            modelo_usado = EXCLUDED.modelo_usado;
     """
 
     valores_laudos = [[d[col] for col in colunas] for d in dados_extraidos]
@@ -551,18 +559,27 @@ def processar_em_lote():
                         coordenadas TEXT,
                         latitude DOUBLE PRECISION,
                         longitude DOUBLE PRECISION,
-                        path TEXT
+                        path TEXT,
+                        modelo_usado TEXT
                     );
                 """)
+                # Se a tabela já existia de uma versão anterior (sem essa
+                # coluna), adiciona agora - não afeta quem já está com a
+                # tabela em dia.
                 cursor.execute("""
-                    DO $$
-                    BEGIN
-                        IF NOT EXISTS (
-                            SELECT 1 FROM pg_constraint WHERE conname = 'laudos_path_key'
-                        ) THEN
-                            ALTER TABLE laudos ADD CONSTRAINT laudos_path_key UNIQUE (path);
-                        END IF;
-                    END $$;
+                    ALTER TABLE laudos ADD COLUMN IF NOT EXISTS modelo_usado TEXT;
+                """)
+                # Remove a constraint antiga (baseada em "path") de uma versão
+                # anterior deste script, se existir no seu banco.
+                cursor.execute("""
+                    ALTER TABLE laudos DROP CONSTRAINT IF EXISTS laudos_path_key;
+                """)
+                # Índice único parcial: garante 1 linha por N° de Proposta,
+                # mas ignora laudos com numero_proposta vazio (não identificado)
+                # para eles não colidirem uns com os outros.
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS laudos_numero_proposta_key
+                    ON laudos (numero_proposta) WHERE numero_proposta <> '';
                 """)
                 execute_values(cursor, query_upsert_laudos, valores_laudos, page_size=100)
                 conn.commit()

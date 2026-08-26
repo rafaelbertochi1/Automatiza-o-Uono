@@ -22,7 +22,9 @@ script (nunca ficam salvos no arquivo nem vão pro GitHub).
 
 import os
 import re
+import sys
 import getpass
+from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 LOGIN_URL = "https://inspectos.com/sistema/index.html#/home"
@@ -32,12 +34,37 @@ DOWNLOAD_DIR = os.path.join(PASTA_SCRIPT, "data", "laudos")
 # e outra. NUNCA suba essa pasta pro GitHub (já está no .gitignore) -
 # ela guarda o acesso logado à sua conta da Inspectos.
 PERFIL_DIR = os.path.join(PASTA_SCRIPT, "chrome_profile_inspectos")
+# Cada execução salva um log completo aqui (também nunca vai pro GitHub).
+LOG_DIR = os.path.join(PASTA_SCRIPT, "logs")
 
 # Quantos laudos baixar nesta execução. Cada página da lista tem 30
 # laudos, então 40 força passar da página 1 pra 2 e testa a paginação.
 # Depois que estiver funcionando, aumente para 9999 para pegar tudo do
 # período.
 LIMITE_TESTE = 40
+
+# True = remove a pausa artificial entre cada clique (bem mais rápido).
+# A janela do Chrome continua visível mesmo com True - mantemos assim de
+# propósito, porque se a verificação de segurança (MFA) pedir de novo no
+# futuro, você precisa conseguir ver e responder na tela. Só considere
+# rodar 100% escondido (headless) depois que o robô estiver rodando sem
+# nenhum ajuste há um bom tempo.
+MODO_RAPIDO = True
+
+
+class Tee:
+    """Escreve simultaneamente no terminal e num arquivo de log."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, dado):
+        for s in self.streams:
+            s.write(dado)
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
 
 
 def extrair_numero_proposta(texto_linha):
@@ -65,28 +92,46 @@ def pausar_para_usuario(*linhas_instrucao):
 
 
 def main():
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    os.makedirs(PERFIL_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    # Tudo que aparece no terminal a partir daqui também é salvo num
+    # arquivo de log (um por execução), pra você ter um histórico do que
+    # rodou, quando, e o que foi baixado/pulado/deu erro.
+    log_path = os.path.join(LOG_DIR, f"execucao_{datetime.now():%Y%m%d_%H%M%S}.txt")
+    log_file = open(log_path, "w", encoding="utf-8")
+    stdout_original = sys.stdout
+    sys.stdout = Tee(stdout_original, log_file)
+
     print("=" * 60)
     print(" ROBÔ DE DOWNLOAD - INSPECTOS")
     print("=" * 60)
+    print(f"Log desta execução: {log_path}")
     data_inicio = pedir_dado("Data inicial (dd/mm/aaaa)")
     data_fim = pedir_dado("Data final (dd/mm/aaaa)")
     email = pedir_dado("E-mail Inspectos")
+    # O que você digita no input() não aparece sozinho no arquivo de log
+    # (só o teclado ecoando na tela, não passa pelo print) - por isso
+    # repetimos aqui, pra o log sempre mostrar qual período foi usado.
+    print(f"Período usado: {data_inicio} até {data_fim}")
     print("\n" + "-" * 60)
     print(">>> PRECISO DE UMA INFORMAÇÃO SUA <<<")
     senha = getpass.getpass("Senha Inspectos (não aparece na tela, é normal): ")
 
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    os.makedirs(PERFIL_DIR, exist_ok=True)
-
     with sync_playwright() as p:
-        # headless=False = abre o Chrome de verdade na sua tela, pra
-        # você acompanhar o robô clicando sozinho. NÃO mexa na janela
-        # enquanto ele estiver rodando.
+        # A janela do Chrome fica sempre visível (headless=False) - de
+        # propósito, pra você poder ver e responder se a verificação de
+        # segurança (MFA) pedir de novo. MODO_RAPIDO só controla a pausa
+        # artificial entre cliques (slow_mo).
         # launch_persistent_context guarda a sessão em PERFIL_DIR: depois
         # da primeira vez que você confirmar o código de verificação (MFA)
         # manualmente, as próximas execuções não devem mais pedir isso.
         context = p.chromium.launch_persistent_context(
-            PERFIL_DIR, headless=False, slow_mo=300, accept_downloads=True
+            PERFIL_DIR,
+            headless=False,
+            slow_mo=0 if MODO_RAPIDO else 300,
+            accept_downloads=True,
         )
         page = context.new_page()
 
@@ -221,6 +266,9 @@ def main():
             page.wait_for_selector(LINHA_SELECTOR, timeout=20000)
 
             total_baixados = 0
+            total_pulados_existentes = 0
+            total_sem_laudo = 0
+            total_erros = 0
             pagina_num = 1
 
             while total_baixados < LIMITE_TESTE:
@@ -232,14 +280,24 @@ def main():
                 # (relocalizamos a linha certa pelo conteúdo, não pela posição).
                 linhas = page.locator(LINHA_SELECTOR)
                 qtd_linhas = linhas.count()
-                print(f"  Página {pagina_num}: {qtd_linhas} laudos encontrados na tela.")
 
+                # A mesma linha aparece duplicada várias vezes no HTML dessa
+                # tela (provavelmente uma versão escondida por responsividade,
+                # igual achamos com o botão "próxima"). Por isso removemos
+                # duplicatas pelo N° de Proposta antes de processar, senão o
+                # mesmo laudo é reaberto várias vezes à toa na mesma página.
                 laudos_da_pagina = []
+                propostas_vistas = set()
                 for i in range(qtd_linhas):
                     texto_linha = linhas.nth(i).inner_text()
                     numero_proposta = extrair_numero_proposta(texto_linha) or f"linha{i}"
                     laudo_id = texto_linha.split("\n")[0].strip()
+                    if numero_proposta in propostas_vistas:
+                        continue
+                    propostas_vistas.add(numero_proposta)
                     laudos_da_pagina.append((numero_proposta, laudo_id))
+
+                print(f"  Página {pagina_num}: {len(laudos_da_pagina)} laudos únicos encontrados na tela.")
 
                 for numero_proposta, laudo_id in laudos_da_pagina:
                     if total_baixados >= LIMITE_TESTE:
@@ -252,6 +310,7 @@ def main():
                     # abrir a linha - economiza tempo em reprocessamentos.
                     if os.path.exists(destino):
                         print(f"    -> {laudo_id} (proposta {numero_proposta}) já baixado antes, pulando.")
+                        total_pulados_existentes += 1
                         continue
 
                     print(f"    -> Abrindo laudo {laudo_id} (proposta {numero_proposta})...")
@@ -267,6 +326,7 @@ def main():
                         linha = page.locator(LINHA_SELECTOR, has_text=numero_proposta)
                         if linha.count() == 0:
                             print(f"       [PULADO] Não achei mais a linha de {laudo_id} na tela.")
+                            total_erros += 1
                             continue
                         linha.first.click()
                         page.wait_for_selector("text=DETALHAR INSPEÇÃO", timeout=15000)
@@ -283,6 +343,7 @@ def main():
 
                         if aviso_sem_laudo.count() > 0:
                             print(f"       [PULADO] Ainda não há laudo publicado para {laudo_id}.")
+                            total_sem_laudo += 1
                         else:
                             icone_engrenagem.first.click()
                             page.click("text=Download")
@@ -299,8 +360,10 @@ def main():
 
                     except PlaywrightTimeout as e:
                         print(f"       [PULADO - ERRO] Travou nesse laudo específico: {str(e).splitlines()[0]}")
+                        total_erros += 1
                     except Exception as e:
                         print(f"       [PULADO - ERRO INESPERADO] {str(e)}")
+                        total_erros += 1
                     finally:
                         # Sempre tenta fechar o modal e voltar pra lista, mesmo
                         # se algo deu errado acima, pra não travar os próximos.
@@ -335,7 +398,14 @@ def main():
                 pagina_num += 1
                 page.wait_for_selector(LINHA_SELECTOR, timeout=15000)
 
-            print(f"\n[6/6] Concluído! {total_baixados} laudo(s) baixado(s) em {DOWNLOAD_DIR}")
+            print("\n[6/6] Concluído!")
+            print("-" * 60)
+            print(f"  Baixados agora:            {total_baixados}")
+            print(f"  Já existiam (pulados):     {total_pulados_existentes}")
+            print(f"  Sem laudo publicado ainda: {total_sem_laudo}")
+            print(f"  Com erro (pulados):        {total_erros}")
+            print(f"  Pasta: {DOWNLOAD_DIR}")
+            print("-" * 60)
 
         except PlaywrightTimeout as e:
             print("\n[ERRO] O robô travou esperando um elemento aparecer na tela.")
@@ -351,6 +421,8 @@ def main():
             print("#" * 60)
             input(">>> Pressione ENTER aqui para fechar o navegador... ")
             context.close()
+            sys.stdout = stdout_original
+            log_file.close()
 
 
 if __name__ == "__main__":

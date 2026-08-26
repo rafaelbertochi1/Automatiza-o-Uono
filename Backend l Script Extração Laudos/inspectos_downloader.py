@@ -42,19 +42,24 @@ SESSION_FILE = os.path.join(PASTA_SCRIPT, "sessao_inspectos.json")
 # Cada execução salva um log completo aqui (também nunca vai pro GitHub).
 LOG_DIR = os.path.join(PASTA_SCRIPT, "logs")
 
-# Quantos laudos baixar nesta execução. Cada página da lista tem 30
-# laudos, então 40 força passar da página 1 pra 2 e testa a paginação.
-# Depois que estiver funcionando, aumente para 9999 para pegar tudo do
-# período.
+# Quantos laudos baixar nesta execução. Cada página da lista tem só 6
+# laudos de verdade (confirmado testando ao vivo), então mesmo um período
+# pequeno já passa por várias páginas. Aumente para 9999 para pegar tudo
+# do período de uma vez.
 LIMITE_TESTE = 40
 
 # True = remove a pausa artificial entre cada clique (bem mais rápido).
-# A janela do Chrome continua visível mesmo com True - mantemos assim de
-# propósito, porque se a verificação de segurança (MFA) pedir de novo no
-# futuro, você precisa conseguir ver e responder na tela. Só considere
-# rodar 100% escondido (headless) depois que o robô estiver rodando sem
-# nenhum ajuste há um bom tempo.
 MODO_RAPIDO = True
+
+# Login e seleção do cliente Santander agora são 100% automáticos (sessão
+# salva + clique automático), então não precisa mais ver a janela do
+# Chrome no dia a dia - HEADLESS = True roda tudo escondido, sem abrir
+# nenhuma janela. Se a sessão salva expirar de verdade (login manual
+# necessário de novo), o robô AVISA no terminal e para, em vez de travar
+# esperando uma tela que você não consegue ver - nesse caso, mude essa
+# constante pra False, rode de novo pra refazer o login manualmente uma
+# única vez, e depois pode voltar pra True (a sessão fica salva de novo).
+HEADLESS = True
 
 
 class Tee:
@@ -120,16 +125,25 @@ def main():
     print(f"Período usado: {data_inicio} até {data_fim}")
 
     with sync_playwright() as p:
-        # A janela do Chrome fica sempre visível (headless=False) - de
-        # propósito, pra você poder ver e responder se a verificação de
-        # segurança (MFA) pedir de novo. MODO_RAPIDO só controla a pausa
-        # artificial entre cliques (slow_mo).
-        browser = p.chromium.launch(headless=False, slow_mo=0 if MODO_RAPIDO else 300)
+        # Com HEADLESS=False (só usado pra refazer login manual), abrimos
+        # maximizado (--start-maximized + no_viewport) pra usar o tamanho
+        # real da tela, igual ao Chrome comum. Com HEADLESS=True não existe
+        # janela física, então fixamos um viewport bem grande "na mão" -
+        # em ambos os casos, importa manter uma área grande porque a
+        # tabela de laudos usa rolagem virtual (só desenha no HTML as
+        # linhas que cabem na altura visível).
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            slow_mo=0 if MODO_RAPIDO else 300,
+            args=[] if HEADLESS else ["--start-maximized"],
+        )
         # Se já existe uma sessão salva de uma execução anterior, carrega
         # ela agora (cookies + localStorage), em vez de começar do zero.
         sessao_existente = os.path.exists(SESSION_FILE)
         context = browser.new_context(
             accept_downloads=True,
+            viewport={"width": 1920, "height": 1080} if HEADLESS else None,
+            no_viewport=None if HEADLESS else True,
             storage_state=SESSION_FILE if sessao_existente else None,
         )
         page = context.new_page()
@@ -153,9 +167,50 @@ def main():
                 except PlaywrightTimeout:
                     return False
 
+            def selecionar_cliente_santander(timeout=6000):
+                # A tela "ESCOLHA O CLIENTE DESEJADO" (Itaú / Santander)
+                # aparece logo depois de entrar na URL - inclusive quando a
+                # sessão salva (cookie de login) continua válida, porque
+                # essa escolha de cliente não fica salva junto. Sem clicar
+                # aqui, chegou_no_painel() dava timeout e o robô concluía
+                # (errado) que a sessão tinha expirado, disparando a pausa
+                # de login manual completo à toa em toda execução.
+                # O logo do Santander é uma imagem (sem texto pesquisável),
+                # então usamos a ordem dos cards - confirmada via Inspecionar
+                # elemento: Itaú é sempre o 1º (índice 0), Santander o 2º
+                # (índice 1).
+                selecionar = page.locator("text=SELECIONAR")
+                try:
+                    selecionar.first.wait_for(timeout=timeout)
+                except PlaywrightTimeout:
+                    return False  # não é essa tela agora - segue o fluxo normal
+
+                if selecionar.count() < 2:
+                    # Layout mudou (só 1 cliente listado, ou mais que 2) -
+                    # mais seguro parar e deixar manual do que arriscar
+                    # clicar no cliente errado.
+                    print("      [AVISO] Tela de cliente com layout inesperado - selecione manualmente.")
+                    return False
+
+                selecionar.nth(1).click()
+                page.wait_for_timeout(500)
+                print("      Cliente Santander selecionado automaticamente.")
+                return True
+
             page.goto(LOGIN_URL)
+            selecionar_cliente_santander()
             if sessao_existente and chegou_no_painel(timeout=10000):
                 print("      Sessão válida, painel carregado direto.")
+            elif HEADLESS:
+                # Sem janela visível não dá pra fazer login manual (e-mail/
+                # senha, MFA) - melhor avisar claramente e parar do que
+                # travar esperando uma tela que ninguém vai ver.
+                print("\n[ERRO] A sessão salva expirou (ou pediu verificação de novo), e o robô")
+                print("está rodando sem tela (HEADLESS = True) - não dá pra fazer login manual assim.")
+                print(f"Abra o {os.path.basename(__file__)}, mude HEADLESS para False, rode de novo")
+                print("pra refazer o login manualmente uma vez, e depois pode voltar HEADLESS")
+                print("para True - a sessão fica salva de novo.")
+                return
             else:
                 # A sessão salva expirou, foi limpa, nunca existiu, ou pediu
                 # verificação de novo. Como o robô não tem como digitar
@@ -165,7 +220,8 @@ def main():
                     "A sessão salva não está mais válida (ou pediu login/",
                     "verificação de novo).",
                     "1. Faça o login manualmente na janela do Chrome (e-mail e senha).",
-                    "2. Selecione o cliente Santander, se for pedido.",
+                    "2. Selecione o cliente Santander, se for pedido (o robô já",
+                    "   tenta fazer isso sozinho, mas confirme se ele conseguiu).",
                     "3. Complete a verificação de segurança, se pedir.",
                     "4. Espere até ver a tela com 'GRID DE INSPEÇÃO'.",
                 )
@@ -220,6 +276,12 @@ def main():
 
             preencher_data(campos_data.nth(0), data_inicio)
             preencher_data(campos_data.nth(1), data_fim)
+            # NOTA: os botões "30 / 60 / 90" ao lado dos campos de data são
+            # atalhos de PERÍODO ("últimos N dias"), não de itens por
+            # página - já tentamos clicar no "90" aqui pra aumentar o
+            # tamanho de página e isso SOBRESCREVIA as datas digitadas pelo
+            # usuário sem avisar. Não mexer nesses botões.
+
             page.get_by_role("button", name="Exibir").click()
 
             # ----------------------------------------------------------------
@@ -231,8 +293,34 @@ def main():
             #      ng-repeat="insp in listaInspecao">
             # (confirmado via Inspecionar elemento). As 3 classes juntas
             # evitam pegar a linha de cabeçalho por engano.
-            LINHA_SELECTOR = "div.insp360-mouse-link.insp360-tabela-relatorio.insp360-cor-tabela-rel"
+            # A tela tem 5 abas (Crédito PF, PJ, Garantias, Renegociação,
+            # Renegociação CI) e o HTML mantém as linhas de TODAS elas ao
+            # mesmo tempo, escondendo por CSS as abas que não estão ativas
+            # (mesmo problema já visto no botão "próxima"). Sem o ":visible"
+            # aqui, `linhas.count()`/`.last` podem pegar uma linha de uma
+            # aba escondida - que nunca "aparece" rolando (trava pra sempre)
+            # e infla a contagem com linhas que não estão realmente na tela.
+            LINHA_SELECTOR = "div.insp360-mouse-link.insp360-tabela-relatorio.insp360-cor-tabela-rel:visible"
             page.wait_for_selector(LINHA_SELECTOR, timeout=20000)
+
+            def carregar_todas_as_linhas():
+                # Essa tabela tem rolagem interna com carregamento preguiçoso:
+                # só fica no HTML as linhas visíveis no momento (confirmado
+                # em execução real - toda página lia exatamente 6 linhas,
+                # sempre, mesmo com o filtro trazendo bem mais resultados, e
+                # o print da tela mostra uma barra de rolagem própria da
+                # tabela). Rolamos até a última linha carregada e recontamos,
+                # repetindo até a contagem parar de crescer, garantindo que
+                # TODAS as linhas dessa página entrem no HTML antes de ler.
+                linhas = page.locator(LINHA_SELECTOR)
+                qtd_anterior = -1
+                qtd_atual = linhas.count()
+                while qtd_atual != qtd_anterior:
+                    qtd_anterior = qtd_atual
+                    linhas.last.scroll_into_view_if_needed()
+                    page.wait_for_timeout(400)
+                    qtd_atual = linhas.count()
+                return linhas
 
             total_baixados = 0
             total_pulados_existentes = 0
@@ -250,7 +338,7 @@ def main():
                 # Proposta PODE se repetir legitimamente entre laudos
                 # diferentes, então não pode ser usado pra identificar a linha
                 # nem pra nomear o arquivo).
-                linhas = page.locator(LINHA_SELECTOR)
+                linhas = carregar_todas_as_linhas()
                 qtd_linhas = linhas.count()
 
                 # A mesma linha aparece duplicada várias vezes no HTML dessa
@@ -403,10 +491,15 @@ def main():
                 salvar_sessao()
             except Exception:
                 pass
-            print("\n" + "#" * 60)
-            print("#  A AÇÃO É SUA AGORA - O ROBÔ ESTÁ PAUSADO")
-            print("#" * 60)
-            input(">>> Pressione ENTER aqui para fechar o navegador... ")
+            if not HEADLESS:
+                # Só faz sentido pausar pra você olhar a janela do Chrome
+                # antes de fechar quando ela existe de verdade (HEADLESS =
+                # False). Rodando escondido não tem nada pra olhar, então
+                # encerra sozinho.
+                print("\n" + "#" * 60)
+                print("#  A AÇÃO É SUA AGORA - O ROBÔ ESTÁ PAUSADO")
+                print("#" * 60)
+                input(">>> Pressione ENTER aqui para fechar o navegador... ")
             browser.close()
             sys.stdout = stdout_original
             log_file.close()

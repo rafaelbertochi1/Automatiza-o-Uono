@@ -3,25 +3,33 @@ import re
 import multiprocessing
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from decimal import Decimal, InvalidOperation
 import pdfplumber
 import psycopg2
+from psycopg2.extras import execute_values
 
-# ----------------------------------------------------------------------
-# 1. FUNÇÕES AUXILIARES DE TRATAMENTO DE DADOS
-# ----------------------------------------------------------------------
+ZERO = Decimal('0.00')
+
 def converter_float_seguro(val):
+    # Decimal em vez de float pra não gerar sobra de binário
+    # (8666.299999999999 em vez de 8666.30) nas colunas NUMERIC.
     if val is None:
-        return 0.0
+        return ZERO
+    if isinstance(val, Decimal):
+        return val.quantize(Decimal('0.01'))
     if isinstance(val, (int, float)):
-        return round(float(val), 2)
+        try:
+            return Decimal(str(val)).quantize(Decimal('0.01'))
+        except InvalidOperation:
+            return ZERO
 
     s_val = str(val).strip()
     if not s_val or s_val.upper() in ['-', '--', '—', 'NONE', 'NULL']:
-        return 0.0
+        return ZERO
 
     match = re.search(r'[-+]?[\d\.,]+', s_val)
     if not match:
-        return 0.0
+        return ZERO
 
     num_str = match.group(0)
 
@@ -37,9 +45,9 @@ def converter_float_seguro(val):
         num_str = num_str.replace(',', '.')
 
     try:
-        return round(float(num_str), 2)
-    except Exception:
-        return 0.0
+        return Decimal(num_str).quantize(Decimal('0.01'))
+    except InvalidOperation:
+        return ZERO
 
 def converter_int_seguro(val):
     try:
@@ -76,15 +84,8 @@ def limpar_txt(val, valor_padrao=""):
     return txt if txt and txt.upper() != "NULL" else valor_padrao
 
 def extrair_numero_proposta(text):
-    """Extrai o N° de Proposta do cabeçalho ('DADOS DO PEDIDO').
-
-    O cabeçalho é uma tabela de 3 colunas (Solicitante / N° da Proposta /
-    Data Solicitação), com os valores numa única linha logo abaixo dos
-    rótulos - ex: "Santander 2.714.283 01/07/2026". O número às vezes vem
-    com pontos de milhar. Usamos a data que sempre vem logo depois como
-    âncora pra garantir que pegamos o número certo (evita cair no CREA do
-    avaliador ou outro número solto do documento).
-    """
+    # Ancora na data que vem logo depois do número (ex: "2.714.283 01/07/2026")
+    # pra não cair no CREA do avaliador ou outro número solto do documento.
     m = re.search(
         r'N[º°]?\s*da\s*Proposta[^\n]*\n(?:\S+\s+)?([\d][\d\.]{4,14}\d)\s+\d{2}/\d{2}/\d{4}',
         text, re.IGNORECASE
@@ -92,29 +93,18 @@ def extrair_numero_proposta(text):
     if m:
         return m.group(1).replace('.', '')
 
-    # Rótulo e valor juntos, sem o layout de tabela acima
     m = re.search(r'(?:Proposta|N[º°]?\s*da\s*Proposta)\s*[:\n]?\s*(\d{6,12})', text, re.IGNORECASE)
     if m:
         return m.group(1)
 
-    # Último recurso: primeiro número solto de 7-10 dígitos no documento
     m = re.search(r'\b(\d{7,10})\b', text)
     return m.group(1) if m else ""
 
 def extrair_data_avaliacao(text):
-    """Extrai a data em que a vistoria (visita ao imóvel) foi realmente
-    feita - NÃO a data em que a proposta foi apenas solicitada.
-
-    A primeira data que aparece no documento é sempre a "Data Solicitação"
-    do cabeçalho (tabela DADOS DO PEDIDO/Solicitante), que pode ficar dias
-    ou até semanas antes da vistoria de fato (confirmado no laudo_TAT1064:
-    solicitação em 02/07 e fotos da vistoria só em 24/07 - 22 dias depois).
-    A seção RELATÓRIO FOTOGRÁFICO traz o carimbo de data/hora de cada foto
-    tirada durante a visita, então usamos a primeira data logo depois dela
-    como âncora confiável da data real da vistoria/avaliação. A nota
-    "Vistoria realizada em ..." (quando existe) confirma a mesma data, mas
-    nem todo laudo tem essa nota, então ela só serve de segunda opção.
-    """
+    # A data da vistoria de verdade, não a Data Solicitação do cabeçalho
+    # (que costuma vir antes e pode ficar semanas fora do dia real da
+    # visita). A seção RELATÓRIO FOTOGRÁFICO carimba a data de cada foto
+    # tirada na visita, é a âncora mais confiável.
     m = re.search(r'RELAT[ÓO]RIO\s+FOTOGR[ÁA]FICO[^\n]*\n+\s*(\d{2}/\d{2}/\d{4})', text, re.IGNORECASE)
     if m:
         return m.group(1)
@@ -123,46 +113,49 @@ def extrair_data_avaliacao(text):
     if m:
         return m.group(1)
 
-    # Último recurso: primeira data solta do documento (pode ser a Data
-    # Solicitação, mas é melhor que ficar sem nenhuma data).
     m = re.search(r'(\d{2}/\d{2}/\d{4})', text)
     return m.group(1) if m else None
 
-# ----------------------------------------------------------------------
-# 1.1 EXTRAÇÃO DE COORDENADAS
-# ----------------------------------------------------------------------
+def _dms_para_decimal(graus, minutos, segundos, hemisferio):
+    valor = float(graus) + float(minutos) / 60 + float(segundos) / 3600
+    return -valor if hemisferio in ('S', 'W') else valor
+
 def extrair_coordenadas_generico(text):
     texto_limpo = re.sub(r'-\s+([\d\.]+)', r'-\1', text)
-    match_rotulo = re.search(
+    # "Localização" também aparece como título de seção sem coordenada
+    # nenhuma perto - percorre todas as ocorrências até achar uma com
+    # números de verdade, em vez de parar na primeira (que pode ser essa).
+    for match_rotulo in re.finditer(
         r'(?:Coordenadas|Localização|Geolocalização)[^\n:]*[:\n]?\s*([-\d\.\s,\n]+)',
         texto_limpo,
         re.IGNORECASE
+    ):
+        candidatos = re.findall(r'(-?\d{1,3}\.\d{4,16})', match_rotulo.group(1))
+        if len(candidatos) >= 2:
+            lat_raw = converter_float_coordenada(candidatos[0])
+            lon_raw = converter_float_coordenada(candidatos[1])
+            if lat_raw is not None and lon_raw is not None:
+                lat_final = -abs(lat_raw)
+                lon_final = -abs(lon_raw)
+                return f"{lat_final}, {lon_final}", lat_final, lon_final
+
+    # sem rótulo "Coordenadas:" explícito - tenta o carimbo de GPS das
+    # fotos (grau/min/seg, ex: 9°25'58"S / 40°28'13"W), que se repete no
+    # RELATÓRIO FOTOGRÁFICO. Sem isso, varrer o documento inteiro atrás de
+    # qualquer número parecido com coordenada pega lixo de outras tabelas
+    # (já vimos pegar desvio padrão de uma análise estatística por engano).
+    m = re.search(
+        r"(\d{1,3})°(\d{1,2})'(\d{1,2})\"([NS])\s*/\s*(\d{1,3})°(\d{1,2})'(\d{1,2})\"([EW])",
+        texto_limpo
     )
-    texto_busca = match_rotulo.group(1) if match_rotulo else texto_limpo
-    candidatos = re.findall(r'(-?\d{1,3}\.\d{4,16})', texto_busca)
-
-    if len(candidatos) >= 2:
-        lat_raw = converter_float_coordenada(candidatos[0])
-        lon_raw = converter_float_coordenada(candidatos[1])
-        if lat_raw is not None and lon_raw is not None:
-            lat_final = -abs(lat_raw)
-            lon_final = -abs(lon_raw)
-            return f"{lat_final}, {lon_final}", lat_final, lon_final
-
-    candidatos_full = re.findall(r'(-?\d{1,3}\.\d{4,16})', texto_limpo)
-    if len(candidatos_full) >= 2:
-        lat_raw = converter_float_coordenada(candidatos_full[0])
-        lon_raw = converter_float_coordenada(candidatos_full[1])
-        if lat_raw is not None and lon_raw is not None:
-            lat_final = -abs(lat_raw)
-            lon_final = -abs(lon_raw)
-            return f"{lat_final}, {lon_final}", lat_final, lon_final
+    if m:
+        lat_g, lat_m, lat_s, lat_h, lon_g, lon_m, lon_s, lon_h = m.groups()
+        lat_final = round(_dms_para_decimal(lat_g, lat_m, lat_s, lat_h), 8)
+        lon_final = round(_dms_para_decimal(lon_g, lon_m, lon_s, lon_h), 8)
+        return f"{lat_final}, {lon_final}", lat_final, lon_final
 
     return None, None, None
 
-# ----------------------------------------------------------------------
-# 1.2 ENDEREÇO E COMPLEMENTO
-# ----------------------------------------------------------------------
 _TIPOS_LOGRADOURO = (
     r'RUA|AVENIDA|AV\.|AL\.|ALAMEDA|ESTRADA|TRAVESSA|ROD\.|RODOVIA|'
     r'LARGO|PRA[ÇC]A|VIA|QUADRA'
@@ -207,9 +200,6 @@ def extrair_complemento_generico(text):
 
     return ""
 
-# ----------------------------------------------------------------------
-# 2. PARSER MODELO DIGITAL (AVM)
-# ----------------------------------------------------------------------
 def extrair_modelo_digital(text):
     cod_laudo = re.search(r'#(TA[NOP]\d+|\w+\d+)', text)
     num_proposta_val = extrair_numero_proposta(text)
@@ -231,7 +221,7 @@ def extrair_modelo_digital(text):
 
     area_priv = converter_float_seguro(area_priv_match.group(1) if area_priv_match else None)
     area_comum = converter_float_seguro(area_com_match.group(1) if area_com_match else None)
-    area_total = round(float(area_priv + area_comum), 2) if area_priv > 0 else 0.0
+    area_total = (area_priv + area_comum).quantize(Decimal('0.01')) if area_priv > 0 else ZERO
 
     banheiros = re.search(r'Banheiro\s*Social:\s*(\d+)', text, re.IGNORECASE) or re.search(r'(\d+)\s*(?=banheiro)', text, re.IGNORECASE)
     quartos = re.search(r'Dormitóri[oa]s?:\s*(\d+)', text, re.IGNORECASE) or re.search(r'(\d+)\s*(?=quarto|dormit)', text, re.IGNORECASE)
@@ -320,9 +310,6 @@ def extrair_modelo_digital(text):
         "longitude": lon
     }
 
-# ----------------------------------------------------------------------
-# 3. PARSER MODELO FÍSICO (QUESTIONÁRIO / PRESENCIAL)
-# ----------------------------------------------------------------------
 def extrair_modelo_fisico(text):
     cod_laudo = re.search(r'#(TAP\d+|\w+\d+)', text)
     num_proposta_val = extrair_numero_proposta(text)
@@ -334,22 +321,16 @@ def extrair_modelo_fisico(text):
     tipo_imovel = re.search(r'\b(M[úu]ltiplas\s+Unidades|Apartamento|Casa|Sobrado|Terreno(?:\s*-\s*Lote)?)\b', text, re.IGNORECASE)
     tipo_imovel_val = tipo_imovel.group(1) if tipo_imovel else "Apartamento"
 
-    # ------------------------------------------------------------------
-    # CAPTURA ISOLADA DE ÁREAS (SEÇÕES 18 E 19)
-    # ------------------------------------------------------------------
-    area_priv = 0.0
+    area_priv = ZERO
     match_18 = re.search(r'18\s*-\s*[ÁA]rea\s+Privativa[^\n]*\n+([^\n]+)', text, re.IGNORECASE)
     if match_18:
+        # pdfplumber às vezes solta espaço no meio do número ("131. 7")
         linha_18 = match_18.group(1).strip()
-        # Às vezes o pdfplumber extrai o número com um espaço solto no meio
-        # (ex.: "Ferro 131. 7" em vez de "Ferro 131,7"), quebrando o "fim da
-        # linha" no meio do valor. Removemos espaços antes de procurar o
-        # número, pra pegar "131.7" inteiro em vez de só o "7" final.
         val_m = re.search(r'([\d\.,]+)$', re.sub(r'\s+', '', linha_18))
         if val_m:
             area_priv = converter_float_seguro(val_m.group(1))
 
-    area_comum = 0.0
+    area_comum = ZERO
     match_19 = re.search(r'19\s*-\s*[ÁA]rea\s+Comum[^\n]*\n+([^\n]+)', text, re.IGNORECASE)
     if match_19:
         linha_19 = match_19.group(1).strip()
@@ -357,8 +338,7 @@ def extrair_modelo_fisico(text):
         if val_m and not re.search(r'20\s*-', linha_19):
             area_comum = converter_float_seguro(val_m.group(1))
 
-    # Fallback para Terrenos / Casas se Privativa for 0
-    if area_priv == 0.0 and ("casa" in tipo_imovel_val.lower() or "terreno" in tipo_imovel_val.lower()):
+    if area_priv == 0 and ("casa" in tipo_imovel_val.lower() or "terreno" in tipo_imovel_val.lower()):
         match_terreno = re.search(
             r'(?:[Áá]rea\s+do\s+terreno|[Áá]rea\s+constru[íi]da)[^\d]*([\d\.,]+)', 
             text, re.IGNORECASE
@@ -366,13 +346,10 @@ def extrair_modelo_fisico(text):
         if match_terreno:
             area_priv = converter_float_seguro(match_terreno.group(1))
 
-    # Área total calculada de forma exata
-    area_total = round(float(area_priv + area_comum), 2)
+    area_total = (area_priv + area_comum).quantize(Decimal('0.01'))
 
-    # Banheiros (seção 11) e Dormitórios (seção 12) ficam lado a lado na mesma
-    # linha de valores ("<banheiros> <dormitórios>"), então precisam ser lidos
-    # de uma vez só — buscar cada rótulo separadamente faz os dois pegarem o
-    # primeiro número da linha (duplicando o valor de banheiros em dormitórios).
+    # banheiros (11) e dormitórios (12) ficam na mesma linha - precisa
+    # ler os dois juntos, senão os dois pegam o primeiro número
     banheiros_val = 0
     quartos = None
     match_11_12 = re.search(
@@ -383,7 +360,7 @@ def extrair_modelo_fisico(text):
         banheiros_val = converter_int_seguro(match_11_12.group(1))
         quartos = match_11_12.group(2)
 
-    # Mesmo problema em Vagas Cobertas (seção 13) e Vagas Descobertas (seção 14)
+    # mesma coisa em vagas cobertas (13) / descobertas (14)
     vagas_val = 0
     v13 = 0
     v14 = 0
@@ -442,11 +419,24 @@ def extrair_modelo_fisico(text):
 
     if "casa" in tipo_imovel_val.lower() or "sobrado" in tipo_imovel_val.lower() or "DETALHAMENTO DOS VALORES" in text:
         match_casa_averbada = re.search(
-            r'Área\s+constru[íi]da\s+averbada[^\n]*?\n?[^\n]*?R\$\s*([\d\.,]+)', 
+            r'Área\s+constru[íi]da\s+averbada[^\n]*?\n?[^\n]*?R\$\s*([\d\.,]+)',
             text, re.IGNORECASE | re.DOTALL
         )
         if match_casa_averbada:
             val_unit_val = match_casa_averbada.group(1)
+
+    if not val_unit_val:
+        # apartamentos (AVM/comparativo direto): "Área averbada (m²) Valor
+        # unitário (R$/m²) Valor parcial (R$)" seguido da linha de valores
+        # na mesma ordem - o regex genérico abaixo pega o R$ errado aqui
+        # (cai no "(R$/m²)" do próprio título e escorrega pro valor total
+        # do primeiro elemento comparativo)
+        match_area_averbada = re.search(
+            r'[ÁA]rea\s+averbada[^\n]*\n[\d\.,]+\s*R\$\s*([\d\.,]+)',
+            text, re.IGNORECASE
+        )
+        if match_area_averbada:
+            val_unit_val = match_area_averbada.group(1)
 
     if not val_unit_val:
         val_unit_match = re.search(r'VALOR\s+UNIT[ÁA]RIO.*?R\$\s*([\d\.,]+)', text, re.IGNORECASE | re.DOTALL)
@@ -481,9 +471,6 @@ def extrair_modelo_fisico(text):
         "longitude": lon
     }
 
-# ----------------------------------------------------------------------
-# 4. WORKER DE EXTRAÇÃO
-# ----------------------------------------------------------------------
 def extrair_dados_pdf(pdf_path):
     try:
         file_name = os.path.basename(pdf_path)
@@ -508,18 +495,103 @@ def extrair_dados_pdf(pdf_path):
         print(f"[ERRO PARSER] {os.path.basename(pdf_path)}: {str(e)}")
         return None
 
-# ----------------------------------------------------------------------
-# 5. ORQUESTRADOR EM LOTE (MULTITHREAD + UPSERT BANCO)
-# ----------------------------------------------------------------------
 def processar_em_lote():
     folder_path = r"data/laudos"
     if not os.path.exists(folder_path):
         folder_path = "."
 
-    pdf_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith('.pdf')]
-    print(f"Total de PDFs encontrados: {len(pdf_files)}")
+    todos_pdfs = [f for f in os.listdir(folder_path) if f.endswith('.pdf')]
+    print(f"Total de PDFs encontrados: {len(todos_pdfs)}")
+
+    if not todos_pdfs:
+        return
+
+    host_pg = os.getenv("PGURL", "127.0.0.1")
+    dbname = os.getenv("PGNAME", "testdb")
+    user = os.getenv("PGUSR", "postgres")
+    password = os.getenv("PGPASS", "postgres")
+    port = os.getenv("PGPORT", "5432")
+
+    try:
+        conn = psycopg2.connect(host=host_pg, dbname=dbname, user=user, password=password, port=port)
+    except Exception as e:
+        print(f"[ERRO CARGA BANCO]: {str(e)}")
+        return
+
+    with conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS laudos (
+                    id SERIAL PRIMARY KEY,
+                    numero_proposta TEXT,
+                    codigo_laudo TEXT,
+                    data_avaliacao TEXT,
+                    endereco TEXT,
+                    numero TEXT,
+                    complemento TEXT,
+                    tipo_imovel TEXT,
+                    area_privativa_m2 NUMERIC,
+                    area_comum_m2 NUMERIC,
+                    area_total_m2 NUMERIC,
+                    quartos INTEGER,
+                    suites INTEGER,
+                    banheiros INTEGER,
+                    vagas INTEGER,
+                    idade_anos INTEGER,
+                    padrao_acabamento TEXT,
+                    estado_conservacao TEXT,
+                    valor_mercado NUMERIC,
+                    valor_venda_forcada NUMERIC,
+                    valor_unitario_m2 NUMERIC,
+                    coordenadas TEXT,
+                    latitude DOUBLE PRECISION,
+                    longitude DOUBLE PRECISION,
+                    path TEXT,
+                    modelo_usado TEXT
+                );
+            """)
+            cursor.execute("ALTER TABLE laudos ADD COLUMN IF NOT EXISTS modelo_usado TEXT;")
+            cursor.execute("ALTER TABLE laudos DROP CONSTRAINT IF EXISTS laudos_path_key;")
+            cursor.execute("DROP INDEX IF EXISTS laudos_numero_proposta_key;")
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS laudos_codigo_laudo_key
+                ON laudos (codigo_laudo) WHERE codigo_laudo IS NOT NULL;
+            """)
+
+            # bancos antigos ficaram com essas colunas como double
+            # precision em vez de NUMERIC, o que reintroduz sobra de
+            # binário mesmo já mandando Decimal - migra se ainda estiver assim
+            cursor.execute("""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'laudos'
+                          AND column_name = 'valor_unitario_m2'
+                          AND data_type = 'double precision'
+                    ) THEN
+                        ALTER TABLE laudos
+                            ALTER COLUMN valor_unitario_m2   TYPE NUMERIC USING ROUND(valor_unitario_m2::numeric, 2),
+                            ALTER COLUMN valor_mercado       TYPE NUMERIC USING ROUND(valor_mercado::numeric, 2),
+                            ALTER COLUMN valor_venda_forcada TYPE NUMERIC USING ROUND(valor_venda_forcada::numeric, 2),
+                            ALTER COLUMN area_privativa_m2   TYPE NUMERIC USING ROUND(area_privativa_m2::numeric, 2),
+                            ALTER COLUMN area_comum_m2       TYPE NUMERIC USING ROUND(area_comum_m2::numeric, 2),
+                            ALTER COLUMN area_total_m2       TYPE NUMERIC USING ROUND(area_total_m2::numeric, 2);
+                    END IF;
+                END $$;
+            """)
+
+            # pula PDF que já está no banco - evita reextrair à toa
+            cursor.execute("SELECT path FROM laudos WHERE path IS NOT NULL;")
+            ja_processados = {row[0] for row in cursor.fetchall()}
+
+    pdf_files = [os.path.join(folder_path, f) for f in todos_pdfs if f not in ja_processados]
+    pulados_ja_no_banco = len(todos_pdfs) - len(pdf_files)
+    print(f"  {pulados_ja_no_banco} já estavam no banco (extração pulada), {len(pdf_files)} novo(s) pra processar.")
 
     if not pdf_files:
+        print("Nada novo pra extrair.")
+        conn.close()
         return
 
     num_workers = min(multiprocessing.cpu_count(), 8)
@@ -535,13 +607,8 @@ def processar_em_lote():
 
     print(f"Extração concluída. Total laudos: {len(dados_extraidos)}")
     if not dados_extraidos:
+        conn.close()
         return
-
-    host_pg = os.getenv("PGURL", "127.0.0.1")
-    dbname = os.getenv("PGNAME", "testdb")
-    user = os.getenv("PGUSR", "postgres")
-    password = os.getenv("PGPASS", "postgres")
-    port = os.getenv("PGPORT", "5432")
 
     colunas = list(dados_extraidos[0].keys())
 
@@ -562,20 +629,17 @@ def processar_em_lote():
         print("  (o último desses arquivos processado vai prevalecer no banco -")
         print("  vale conferir manualmente a extração desses PDFs)\n")
 
-    # "Duplicata" = mesmo código de laudo (codigo_laudo, ex: TAT7848) - é o
-    # único identificador que nunca se repete de verdade. N° de Proposta
-    # PODE se repetir legitimamente (mais de um laudo pra mesma proposta),
-    # então não pode ser usado como chave de duplicata.
-    # A condição "WHERE codigo_laudo IS NOT NULL" evita que dois laudos cujo
-    # código não foi identificado se sobrescrevam por engano.
-    # Cada linha é inserida com seu próprio comando (em vez de um lote só):
-    # isso permite que duas linhas com o mesmo código se sobrescrevam em
-    # sequência sem quebrar a carga inteira (o Postgres não permite que um
-    # único comando "atualize a mesma linha duas vezes").
+    # codigo_laudo é a chave de verdade - numero_proposta pode repetir
     set_clause = ",\n            ".join(
         f"{col} = EXCLUDED.{col}" for col in colunas if col != "codigo_laudo"
     )
     placeholders = ", ".join(["%s"] * len(colunas))
+    query_upsert_lote = f"""
+        INSERT INTO laudos ({', '.join(colunas)})
+        VALUES %s
+        ON CONFLICT (codigo_laudo) WHERE codigo_laudo IS NOT NULL DO UPDATE SET
+            {set_clause};
+    """
     query_upsert_linha = f"""
         INSERT INTO laudos ({', '.join(colunas)})
         VALUES ({placeholders})
@@ -583,80 +647,45 @@ def processar_em_lote():
             {set_clause};
     """
 
+    # um único INSERT não pode atualizar a mesma linha duas vezes, então
+    # dedup por codigo_laudo antes (mantém o último) pra poder gravar tudo
+    # num lote só
+    por_codigo = {}
+    sem_codigo = []
+    for d in dados_extraidos:
+        if d["codigo_laudo"]:
+            por_codigo[d["codigo_laudo"]] = d
+        else:
+            sem_codigo.append(d)
+    dados_para_gravar = list(por_codigo.values()) + sem_codigo
+
     try:
-        with psycopg2.connect(host=host_pg, dbname=dbname, user=user, password=password, port=port) as conn:
+        with conn:
             with conn.cursor() as cursor:
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS laudos (
-                        id SERIAL PRIMARY KEY,
-                        numero_proposta TEXT,
-                        codigo_laudo TEXT,
-                        data_avaliacao TEXT,
-                        endereco TEXT,
-                        numero TEXT,
-                        complemento TEXT,
-                        tipo_imovel TEXT,
-                        area_privativa_m2 NUMERIC,
-                        area_comum_m2 NUMERIC,
-                        area_total_m2 NUMERIC,
-                        quartos INTEGER,
-                        suites INTEGER,
-                        banheiros INTEGER,
-                        vagas INTEGER,
-                        idade_anos INTEGER,
-                        padrao_acabamento TEXT,
-                        estado_conservacao TEXT,
-                        valor_mercado NUMERIC,
-                        valor_venda_forcada NUMERIC,
-                        valor_unitario_m2 NUMERIC,
-                        coordenadas TEXT,
-                        latitude DOUBLE PRECISION,
-                        longitude DOUBLE PRECISION,
-                        path TEXT,
-                        modelo_usado TEXT
-                    );
-                """)
-                # Se a tabela já existia de uma versão anterior (sem essa
-                # coluna), adiciona agora - não afeta quem já está com a
-                # tabela em dia.
-                cursor.execute("""
-                    ALTER TABLE laudos ADD COLUMN IF NOT EXISTS modelo_usado TEXT;
-                """)
-                # Remove a constraint antiga (baseada em "path") de uma versão
-                # anterior deste script, se existir no seu banco.
-                cursor.execute("""
-                    ALTER TABLE laudos DROP CONSTRAINT IF EXISTS laudos_path_key;
-                """)
-                # Índice antigo (baseado em numero_proposta) de uma versão
-                # anterior deste script - N° de Proposta pode se repetir
-                # legitimamente, então essa regra estava errada. Remove se
-                # existir no seu banco.
-                cursor.execute("""
-                    DROP INDEX IF EXISTS laudos_numero_proposta_key;
-                """)
-                # Índice único parcial de verdade: garante 1 linha por código
-                # de laudo (TAT/TAN/TAP...), que nunca se repete de verdade,
-                # ignorando os poucos casos em que a extração não conseguiu
-                # identificar o código (fica NULL) - esses não colidem entre si.
-                cursor.execute("""
-                    CREATE UNIQUE INDEX IF NOT EXISTS laudos_codigo_laudo_key
-                    ON laudos (codigo_laudo) WHERE codigo_laudo IS NOT NULL;
-                """)
-                gravados = 0
-                falhas = 0
-                for dados in dados_extraidos:
-                    valores = [dados[col] for col in colunas]
-                    try:
-                        cursor.execute(query_upsert_linha, valores)
-                        gravados += 1
-                    except Exception as e:
-                        conn.rollback()
-                        falhas += 1
-                        print(f"[ERRO - PULADO] {dados.get('path')}: {str(e).splitlines()[0]}")
-                conn.commit()
-                print(f"[SUCESSO] {gravados} laudo(s) gravado(s) no banco. {falhas} com erro (pulados).")
+                valores = [[dados[col] for col in colunas] for dados in dados_para_gravar]
+                try:
+                    execute_values(cursor, query_upsert_lote, valores, page_size=500)
+                    print(f"[SUCESSO] {len(valores)} laudo(s) gravado(s) no banco (carga em lote). 0 com erro.")
+                except Exception as e:
+                    # se o lote falhar, cai pro linha-a-linha pra isolar o arquivo com problema
+                    conn.rollback()
+                    print(f"[AVISO] Carga em lote falhou ({str(e).splitlines()[0]}) - tentando linha por linha...")
+                    gravados = 0
+                    falhas = 0
+                    for dados in dados_para_gravar:
+                        linha_valores = [dados[col] for col in colunas]
+                        try:
+                            cursor.execute(query_upsert_linha, linha_valores)
+                            gravados += 1
+                        except Exception as e2:
+                            conn.rollback()
+                            falhas += 1
+                            print(f"[ERRO - PULADO] {dados.get('path')}: {str(e2).splitlines()[0]}")
+                    print(f"[SUCESSO] {gravados} laudo(s) gravado(s) no banco. {falhas} com erro (pulados).")
     except Exception as e:
         print(f"[ERRO CARGA BANCO]: {str(e)}")
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     processar_em_lote()
